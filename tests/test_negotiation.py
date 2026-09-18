@@ -27,6 +27,17 @@ def post_audit(accept, candidates):
     )
 
 
+def post_compare(baseline, trial, candidates):
+    return client.post(
+        "/compare-accept",
+        json={
+            "baseline_accept": baseline,
+            "trial_accept": trial,
+            "candidates": candidates,
+        },
+    )
+
+
 # ---------- parse_accept ----------
 
 
@@ -415,3 +426,184 @@ def test_audit_endpoint_400_empty_candidates():
 def test_audit_endpoint_400_malformed_body():
     resp = client.post("/audit-accept", json={"accept": "*/*"})
     assert resp.status_code == 400
+
+
+# ---------- /compare-accept HTTP 接口 ----------
+
+
+def test_compare_endpoint_reports_selection_change_and_alignment():
+    resp = post_compare(
+        "application/json;q=0.9, text/*;q=0.5, */*;q=0.1",
+        "application/json;q=0.1, text/*;q=0.9, */*;q=0.1",
+        [
+            {"media_type": "application/json", "server_priority": 1},
+            {"media_type": "text/html", "server_priority": 5},
+            {"media_type": "image/png", "server_priority": 9},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    baseline, trial = body["baseline"], body["trial"]
+    assert baseline["status"] == 200
+    assert trial["status"] == 200
+    assert baseline["error"] is None and trial["error"] is None
+    assert baseline["selected"]["media_type"] == "application/json"
+    assert trial["selected"]["media_type"] == "text/html"
+    assert body["selection_changed"] is True
+
+    # 两侧 parsed_accept 各自反映自己的 Accept 头。
+    assert [r["range"] for r in baseline["parsed_accept"]] == [
+        "application/json",
+        "text/*",
+        "*/*",
+    ]
+    assert trial["parsed_accept"][0]["q"] == 0.1
+
+    alignment = body["candidate_alignment"]
+    assert [row["index"] for row in alignment] == [0, 1, 2]
+    assert [row["media_type"] for row in alignment] == [
+        "application/json",
+        "text/html",
+        "image/png",
+    ]
+
+    json_row, html_row, png_row = alignment
+    # json：q 0.9->0.1，由选中变为淘汰
+    assert json_row["baseline"]["q"] == 0.9
+    assert json_row["baseline"]["selected"] is True
+    assert json_row["baseline"]["eliminated_reason"] is None
+    assert json_row["trial"]["q"] == 0.1
+    assert json_row["trial"]["selected"] is False
+    assert json_row["trial"]["eliminated_reason"] == "outranked"
+    assert json_row["changed"] is True
+    # html：由淘汰变为选中
+    assert html_row["baseline"]["selected"] is False
+    assert html_row["trial"]["selected"] is True
+    assert html_row["changed"] is True
+    # png：两侧 q/具体度/原因均未变
+    assert png_row["baseline"]["q"] == png_row["trial"]["q"] == 0.1
+    assert png_row["baseline"]["specificity"] == png_row["trial"]["specificity"] == 0
+    assert (
+        png_row["baseline"]["eliminated_reason"]
+        == png_row["trial"]["eliminated_reason"]
+        == "outranked"
+    )
+    assert png_row["changed"] is False
+
+
+def test_compare_endpoint_identical_headers_no_change():
+    resp = post_compare(
+        "*/*",
+        "*/*",
+        [{"media_type": "a/b", "server_priority": 1}, {"media_type": "c/d"}],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["selection_changed"] is False
+    assert body["baseline"]["selected"]["index"] == 0
+    assert body["trial"]["selected"]["index"] == 0
+    assert all(row["changed"] is False for row in body["candidate_alignment"])
+    # 对齐行中仅一个 selected，且两侧一致。
+    row = body["candidate_alignment"][0]
+    assert row["baseline"]["selected"] is True
+    assert row["trial"]["selected"] is True
+    assert body["candidate_alignment"][1]["baseline"]["selected"] is False
+
+
+def test_compare_endpoint_specificity_change_marks_row_changed():
+    # 基线只有 */*（具体度 0）；试验增加精确范围（具体度 2），选择不变但行发生变化。
+    resp = post_compare(
+        "*/*",
+        "*/*;q=0.1, application/json",
+        [{"media_type": "application/json", "server_priority": 0}],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["selection_changed"] is False
+    row = body["candidate_alignment"][0]
+    assert row["baseline"]["specificity"] == 0
+    assert row["baseline"]["matched_range"] == "*/*"
+    assert row["trial"]["specificity"] == 2
+    assert row["trial"]["matched_range"] == "application/json"
+    assert row["changed"] is True
+
+
+def test_compare_endpoint_one_side_406_keeps_its_result():
+    resp = post_compare(
+        "*/*;q=0",
+        "*/*",
+        [{"media_type": "a/b", "server_priority": 0}],
+    )
+    # 一侧 406 不影响整体：HTTP 仍为 200，由侧内 status 标记。
+    assert resp.status_code == 200
+    body = resp.json()
+
+    baseline, trial = body["baseline"], body["trial"]
+    assert baseline["status"] == 406
+    assert baseline["error"] == "not_acceptable"
+    assert baseline["detail"] == "没有可接受的候选表示"
+    assert baseline["selected"] is None
+    assert baseline["candidates"][0]["eliminated_reason"] == "q_zero"
+    assert baseline["parsed_accept"][0]["q"] == 0.0
+
+    assert trial["status"] == 200
+    assert trial["error"] is None
+    assert trial["selected"]["media_type"] == "a/b"
+    assert trial["selected"]["index"] == 0
+    assert trial["candidates"][0]["eliminated_reason"] is None
+
+    assert body["selection_changed"] is True
+    row = body["candidate_alignment"][0]
+    assert row["baseline"]["eligible"] is False
+    assert row["baseline"]["selected"] is False
+    assert row["baseline"]["eliminated_reason"] == "q_zero"
+    assert row["trial"]["eligible"] is True
+    assert row["trial"]["selected"] is True
+    assert row["changed"] is True
+
+
+def test_compare_endpoint_both_sides_406_no_selection_change():
+    resp = post_compare(
+        "text/html",
+        "image/png",
+        [{"media_type": "application/json", "server_priority": 0}],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["baseline"]["status"] == 406
+    assert body["trial"]["status"] == 406
+    assert body["selection_changed"] is False
+    assert body["candidate_alignment"][0]["baseline"]["eliminated_reason"] == "no_match"
+    assert body["candidate_alignment"][0]["trial"]["eliminated_reason"] == "no_match"
+
+
+def test_compare_endpoint_400_bad_baseline_accept():
+    resp = post_compare("application/json;q=2.0", "*/*", [{"media_type": "a/b"}])
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+def test_compare_endpoint_400_bad_trial_accept():
+    resp = post_compare("*/*", "application/json,", [{"media_type": "a/b"}])
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+def test_compare_endpoint_400_wildcard_candidate():
+    resp = post_compare("*/*", "*/*", [{"media_type": "text/*"}])
+    assert resp.status_code == 400
+
+
+def test_compare_endpoint_400_empty_candidates():
+    resp = post_compare("*/*", "*/*", [])
+    assert resp.status_code == 400
+
+
+def test_compare_endpoint_400_malformed_body():
+    resp = client.post(
+        "/compare-accept", json={"baseline_accept": "*/*", "candidates": []}
+    )
+    assert resp.status_code == 400
+    # 缺字段时由 Pydantic 校验统一 400。
+    assert resp.json()["error"] == "bad_request"
