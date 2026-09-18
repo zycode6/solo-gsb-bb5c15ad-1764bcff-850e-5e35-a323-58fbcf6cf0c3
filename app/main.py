@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from .negotiation import (
     AcceptSyntaxError,
     AcceptRange,
+    CandidateResult,
     SPECIFICITY_NAMES,
     audit_accept,
     negotiate,
@@ -25,14 +26,14 @@ logger = logging.getLogger("content-negotiation")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 容器启动初始化：仅记录就绪日志；依赖安装已在镜像构建阶段完成。
-    logger.info("内容协商调试服务已就绪：POST /negotiate, POST /audit-accept")
+    logger.info("内容协商调试服务已就绪：POST /negotiate, POST /audit-accept, POST /compare-accept")
     yield
     logger.info("内容协商调试服务关闭")
 
 
 app = FastAPI(
     title="HTTP 内容协商调试器",
-    description="调试 Accept 头与候选表示之间的匹配、q 值与排序过程；支持静态审计。",
+    description="调试 Accept 头与候选表示之间的匹配、q 值与排序过程；支持静态审计与双 Accept 对比。",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -98,6 +99,50 @@ class AuditResponse(BaseModel):
     parsed_accept: list[dict]
 
 
+class CompareRequest(BaseModel):
+    baseline_accept: str = Field(..., description="基线 Accept 头字符串")
+    trial_accept: str = Field(..., description="试验 Accept 头字符串")
+    candidates: list[CandidateIn] = Field(
+        ..., description="两侧共用的候选表示列表（有序）"
+    )
+
+
+class CompareSideOut(BaseModel):
+    status: str = Field(
+        ..., description="ok 或 not_acceptable（对应该侧单独协商时的 406 结果）"
+    )
+    selected: SelectedOut | None
+    candidates: list[dict]
+    parsed_accept: list[dict]
+
+
+class CompareCandidateSideOut(BaseModel):
+    q: float | None
+    specificity: int | None
+    specificity_name: str | None
+    matched_range: str | None
+    eligible: bool
+    eliminated_reason: str | None
+
+
+class CompareCandidateOut(BaseModel):
+    index: int
+    media_type: str
+    server_priority: float
+    baseline: CompareCandidateSideOut
+    trial: CompareCandidateSideOut
+    changed: bool = Field(..., description="该候选的两侧评估结果是否不一致")
+
+
+class CompareResponse(BaseModel):
+    selection_changed: bool = Field(
+        ..., description="两侧最终选定项是否不同（含一侧无可选候选的情形）"
+    )
+    baseline: CompareSideOut
+    trial: CompareSideOut
+    candidates: list[CompareCandidateOut]
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str
@@ -124,7 +169,7 @@ async def root() -> dict:
     return {
         "service": "http-content-negotiation-debugger",
         "docs": "/docs",
-        "endpoints": ["POST /negotiate", "POST /audit-accept"],
+        "endpoints": ["POST /negotiate", "POST /audit-accept", "POST /compare-accept"],
     }
 
 
@@ -145,7 +190,51 @@ def _accept_to_dict(r: AcceptRange) -> dict:
     }
 
 
-def _validate_candidates(payload: NegotiateRequest) -> JSONResponse | None:
+def _selected_to_dict(r: CandidateResult) -> dict:
+    return {
+        "index": r.index,
+        "media_type": r.media_type,
+        "server_priority": r.server_priority,
+        "matched_range": r.matched_range,
+        "q": r.q,
+        "specificity": r.specificity,
+        "specificity_name": r.specificity_name,
+    }
+
+
+def _candidate_side_view(r: CandidateResult) -> dict:
+    """对比视图中单侧的候选评估结果。"""
+    return {
+        "q": r.q,
+        "specificity": r.specificity,
+        "specificity_name": r.specificity_name,
+        "matched_range": r.matched_range,
+        "eligible": r.eligible,
+        "eliminated_reason": r.eliminated_reason,
+    }
+
+
+def _compare_side_payload(
+    selected_index: int | None,
+    results: list[CandidateResult],
+    accept_ranges: list[AcceptRange],
+) -> dict:
+    """单侧协商结果：与 /negotiate 响应同形，406 时 selected 为 null。"""
+    return {
+        "status": "ok" if selected_index is not None else "not_acceptable",
+        "selected": (
+            _selected_to_dict(results[selected_index])
+            if selected_index is not None
+            else None
+        ),
+        "candidates": [r.to_dict() for r in results],
+        "parsed_accept": [_accept_to_dict(r) for r in accept_ranges],
+    }
+
+
+def _validate_candidates(
+    payload: NegotiateRequest | CompareRequest,
+) -> JSONResponse | None:
     # 业务层校验：候选列表不能为空，server_priority 必须为有限数。
     if not payload.candidates:
         return _bad_request("candidates 不能为空")
@@ -192,15 +281,7 @@ async def do_negotiate(payload: NegotiateRequest):
 
     chosen = results[selected_index]
     return {
-        "selected": {
-            "index": chosen.index,
-            "media_type": chosen.media_type,
-            "server_priority": chosen.server_priority,
-            "matched_range": chosen.matched_range,
-            "q": chosen.q,
-            "specificity": chosen.specificity,
-            "specificity_name": chosen.specificity_name,
-        },
+        "selected": _selected_to_dict(chosen),
         "candidates": candidate_payload,
         "parsed_accept": [_accept_to_dict(r) for r in accept_ranges],
     }
@@ -244,3 +325,59 @@ async def do_audit_accept(payload: NegotiateRequest):
             },
         )
     return body
+
+
+@app.post(
+    "/compare-accept",
+    response_model=CompareResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "任一 Accept 头或候选非法"},
+    },
+)
+async def do_compare_accept(payload: CompareRequest):
+    # 双 Accept 对比：同一组候选分别按 baseline/trial 协商，定位规则调整的影响。
+    invalid = _validate_candidates(payload)
+    if invalid is not None:
+        return invalid
+
+    raw_candidates = [(c.media_type, c.server_priority) for c in payload.candidates]
+
+    sides: dict[str, tuple[int | None, list[CandidateResult], list[AcceptRange]]] = {}
+    for name, accept in (
+        ("baseline", payload.baseline_accept),
+        ("trial", payload.trial_accept),
+    ):
+        try:
+            sides[name] = negotiate(accept, raw_candidates)
+        except AcceptSyntaxError as exc:
+            return _bad_request(f"{name}_accept: {exc}")
+
+    baseline_selected, baseline_results, baseline_ranges = sides["baseline"]
+    trial_selected, trial_results, trial_ranges = sides["trial"]
+
+    # 按候选 index 对齐两侧评估结果，逐字段对比。
+    rows = []
+    for baseline_r, trial_r in zip(baseline_results, trial_results):
+        baseline_view = _candidate_side_view(baseline_r)
+        trial_view = _candidate_side_view(trial_r)
+        rows.append(
+            {
+                "index": baseline_r.index,
+                "media_type": baseline_r.media_type,
+                "server_priority": baseline_r.server_priority,
+                "baseline": baseline_view,
+                "trial": trial_view,
+                "changed": baseline_view != trial_view,
+            }
+        )
+
+    # 某一侧无可接受候选时，该侧保留 406 结果（status/selected=None）与候选明细，
+    # 整体对比不受影响，因此输入合法时固定返回 200。
+    return {
+        "selection_changed": baseline_selected != trial_selected,
+        "baseline": _compare_side_payload(
+            baseline_selected, baseline_results, baseline_ranges
+        ),
+        "trial": _compare_side_payload(trial_selected, trial_results, trial_ranges),
+        "candidates": rows,
+    }

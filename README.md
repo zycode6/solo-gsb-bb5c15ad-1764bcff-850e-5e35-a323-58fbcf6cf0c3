@@ -8,6 +8,10 @@
 此外，`POST /audit-accept` 提供**静态审计**：不返回单一选定项，而是列出每个候选的
 全部命中范围与最终生效范围，并汇总从未生效的 shadowed 范围与同具体度 q 冲突。
 
+`POST /compare-accept` 提供**双 Accept 对比**：同一组候选分别按 `baseline_accept`
+与 `trial_accept` 协商，返回两侧选定项、按候选 index 对齐的 q/具体度/淘汰原因
+对照及 `selection_changed`，便于定位规则调整导致的结果变化。
+
 ## 一条命令启动
 
 ```bash
@@ -185,6 +189,88 @@ curl -i -X POST http://localhost:8000/audit-accept \
   -d '{"accept":"application/json;q=0.3, application/json;q=0.9","candidates":[{"media_type":"application/json","server_priority":1}]}'
 ```
 
+### `POST /compare-accept`
+
+对比调试：给定**同一组候选表示**与两条 Accept 头（`baseline_accept` 与
+`trial_accept`），两侧分别按与 `POST /negotiate` 完全相同的规则独立协商，
+返回两侧选定项、按候选 index 对齐的评估对照及 `selection_changed`，
+便于定位规则（或 Accept 头）调整导致的结果变化。
+
+请求体：
+
+```json
+{
+  "baseline_accept": "application/json;q=0.9, text/*;q=0.5",
+  "trial_accept": "application/json;q=0.4, text/*;q=0.5",
+  "candidates": [
+    {"media_type": "application/json", "server_priority": 1},
+    {"media_type": "text/html", "server_priority": 1}
+  ]
+}
+```
+
+字段说明：`baseline_accept`、`trial_accept` 为两条原始 `Accept` 头字符串；
+`candidates` 与 `POST /negotiate` 完全相同，两侧共用。
+
+#### 对比规则
+
+1. 两侧各自独立执行与 `/negotiate` 相同的解析与协商；任一 Accept 或候选非法时
+   返回与 `/negotiate` 相同的 **400**（`detail` 会标明是 `baseline_accept` 还是
+   `trial_accept`）；
+2. 输入合法时固定返回 **200**：某一侧没有可接受候选时，该侧 `status` 为
+   `"not_acceptable"`、`selected` 为 `null`，并保留该侧完整候选明细（与
+   `/negotiate` 的 406 响应体一致），另一侧与整体对比不受影响；
+3. `selection_changed` 比较两侧最终选定项（一侧无可选、另一侧有可选也视为变化；
+   两侧均无可选视为未变化）；
+4. 顶层 `candidates` 按候选 index 对齐，逐项给出两侧评估视图
+   （`q`/`specificity`/`matched_range`/`eligible`/`eliminated_reason`），
+   任一字段不同则该候选 `changed` 为 `true`。
+
+#### 200 响应示例（节选）
+
+```json
+{
+  "selection_changed": true,
+  "baseline": {
+    "status": "ok",
+    "selected": {"index": 0, "media_type": "application/json",
+                 "matched_range": "application/json", "q": 0.9,
+                 "specificity": 2, "specificity_name": "exact"},
+    "candidates": ["... 与 /negotiate 响应中的 candidates 同形 ..."],
+    "parsed_accept": ["... 与 /negotiate 响应中的 parsed_accept 同形 ..."]
+  },
+  "trial": {
+    "status": "ok",
+    "selected": {"index": 1, "media_type": "text/html",
+                 "matched_range": "text/*", "q": 0.5,
+                 "specificity": 1, "specificity_name": "type_subtype_wildcard"},
+    "candidates": ["..."],
+    "parsed_accept": ["..."]
+  },
+  "candidates": [
+    {
+      "index": 0,
+      "media_type": "application/json",
+      "server_priority": 1.0,
+      "baseline": {"q": 0.9, "specificity": 2, "specificity_name": "exact",
+                   "matched_range": "application/json", "eligible": true,
+                   "eliminated_reason": null},
+      "trial": {"q": 0.4, "specificity": 2, "specificity_name": "exact",
+                "matched_range": "application/json", "eligible": true,
+                "eliminated_reason": "outranked"},
+      "changed": true
+    }
+  ]
+}
+```
+
+```bash
+# 一侧无可接受候选的示例：trial 侧保留 406 结果与候选明细，整体仍为 200
+curl -i -X POST http://localhost:8000/compare-accept \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline_accept":"*/*","trial_accept":"*/*;q=0","candidates":[{"media_type":"text/html","server_priority":0}]}'
+```
+
 ## 本地开发（不使用容器）
 
 ```bash
@@ -203,9 +289,9 @@ pytest -q
 
 ```
 app/
-  main.py          # FastAPI 路由（/negotiate、/audit-accept）、请求/响应模型、错误处理与启动初始化
+  main.py          # FastAPI 路由（/negotiate、/audit-accept、/compare-accept）、请求/响应模型、错误处理与启动初始化
   negotiation.py   # Accept 解析、内容协商与静态审计核心逻辑（无框架依赖，可独立测试）
-tests/             # 协商规则、审计规则与 HTTP 接口测试
+tests/             # 协商规则、审计规则、对比接口与 HTTP 接口测试
 Dockerfile         # 依赖安装与初始化纳入镜像构建阶段
 docker-compose.yml # 一键启动，映射 8000 端口
 ```
